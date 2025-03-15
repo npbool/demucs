@@ -9,10 +9,13 @@
 import logging
 from pathlib import Path
 import typing as tp
-
+import pickle
 from dora.log import fatal, bold
 
+import safetensors
+import os
 from .hdemucs import HDemucs
+from .htdemucs import HTDemucs
 from .repo import RemoteRepo, LocalRepo, ModelOnlyRepo, BagOnlyRepo, AnyModelRepo, ModelLoadingError  # noqa
 from .states import _check_diffq
 
@@ -61,6 +64,19 @@ def get_model(name: str,
     """`name` must be a bag of models name or a pretrained signature
     from the remote AWS model repo or the specified local repo if `repo` is not None.
     """
+    stpath = os.path.join("checkpoints", name + ".safetensors")
+    if not os.path.exists(stpath):
+        raise Exception("No model " + stpath)
+    with open("kwargs.pkl", 'rb') as f:
+        kwargs = pickle.load(f)
+    model = HTDemucs(**kwargs)
+    with safetensors.safe_open(stpath, "pt") as f:
+        state_dict = {}
+        for key in f.keys():
+            state_dict[key] = f.get_tensor(key)
+        model.load_state_dict(state_dict)
+    return model
+
     if name == 'demucs_unittest':
         return demucs_unittest()
     model_repo: ModelOnlyRepo
