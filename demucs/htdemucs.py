@@ -9,12 +9,14 @@ This code contains the spectrogram and Hybrid version of Demucs.
 """
 import math
 
+from functools import partial
 from openunmix.filtering import wiener
 import torch
 from torch import nn
 from torch.nn import functional as F
 from fractions import Fraction
 from einops import rearrange
+import torch.utils.checkpoint
 
 from .transformer import CrossTransformerEncoder
 
@@ -221,6 +223,7 @@ class HTDemucs(nn.Module):
                 training is used during inference.
         """
         super().__init__()
+        self.gradient_checkpointing = False
         self.cac = cac
         self.wiener_residual = wiener_residual
         self.audio_channels = audio_channels
@@ -558,6 +561,21 @@ class HTDemucs(nn.Module):
         saved_t = []  # skip connections, time.
         lengths = []  # saved lengths to properly remove padding, freq branch.
         lengths_t = []  # saved lengths for time branch.
+
+        use_gradient_checkpoint = torch.is_grad_enabled() and self.gradient_checkpointing
+        #print("use gradient checkpoint", use_gradient_checkpoint)
+        ckpt_fn = partial(torch.utils.checkpoint.checkpoint, use_reentrant=False)
+        # def ckpt_fn(fn, *args, **kwargs):
+        #     print("CHECK")
+        #     for x in args:
+        #         if x is not None:
+        #             print("requires grad: ", x.requires_grad)
+        #     return torch.utils.checkpoint.checkpoint(fn, *args, **kwargs)
+        def create_forward(module):
+            def forward(*args, **kwargs):
+                return module(*args, **kwargs)
+            return forward
+
         for idx, encode in enumerate(self.encoder):
             lengths.append(x.shape[-1])
             inject = None
@@ -565,7 +583,10 @@ class HTDemucs(nn.Module):
                 # we have not yet merged branches.
                 lengths_t.append(xt.shape[-1])
                 tenc = self.tencoder[idx]
-                xt = tenc(xt)
+                if use_gradient_checkpoint:
+                    xt = ckpt_fn(create_forward(tenc),xt)
+                else:
+                    xt = tenc(xt)
                 if not tenc.empty:
                     # save for skip connection
                     saved_t.append(xt)
@@ -573,7 +594,10 @@ class HTDemucs(nn.Module):
                     # tenc contains just the first conv., so that now time and freq.
                     # branches have the same shape and can be merged.
                     inject = xt
-            x = encode(x, inject)
+            if use_gradient_checkpoint:
+                x = ckpt_fn(create_forward(encode), x, inject)
+            else:
+                x = encode(x, inject)
             if idx == 0 and self.freq_emb is not None:
                 # add frequency embedding to allow for non equivariant convolutions
                 # over the frequency axis.
@@ -590,7 +614,10 @@ class HTDemucs(nn.Module):
                 x = rearrange(x, "b c (f t)-> b c f t", f=f)
                 xt = self.channel_upsampler_t(xt)
 
-            x, xt = self.crosstransformer(x, xt)
+            if use_gradient_checkpoint:
+                x, xt = ckpt_fn(create_forward(self.crosstransformer), x, xt)
+            else:
+                x, xt = self.crosstransformer(x, xt)
 
             if self.bottom_channels:
                 x = rearrange(x, "b c f t-> b c (f t)")
@@ -611,10 +638,16 @@ class HTDemucs(nn.Module):
                 if tdec.empty:
                     assert pre.shape[2] == 1, pre.shape
                     pre = pre[:, :, 0]
-                    xt, _ = tdec(pre, None, length_t)
+                    if use_gradient_checkpoint:
+                        xt, _ = ckpt_fn(create_forward(tdec), pre, None, length_t)
+                    else:
+                        xt, _ = tdec(pre, None, length_t)
                 else:
                     skip = saved_t.pop(-1)
-                    xt, _ = tdec(xt, skip, length_t)
+                    if use_gradient_checkpoint:
+                        xt, _ = ckpt_fn(create_forward(tdec), xt, skip, length_t)
+                    else:
+                        xt, _ = tdec(xt, skip, length_t)
 
         # Let's make sure we used all stored skip connections.
         assert len(saved) == 0
